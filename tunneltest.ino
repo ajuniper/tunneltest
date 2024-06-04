@@ -1,5 +1,10 @@
 // sketch to create outbound ssh connection to a fixed server, log in
 // there and tunnel connections back to a fixed endpoint on the local network
+
+// TODO use config values for settings
+// TODO switch from async tcp to sync
+
+
 #include <mywifi.h>
 #include <AsyncTCP.h>
 #include "time.h"
@@ -8,8 +13,8 @@
 #include "mytime.h"
 #include <mywebserver.h>
 #include <webupdater.h>
-#include <LittleFS.h>
 #include <map>
+#include "esp_vfs_eventfd.h"
 
 // links
 // Simple example https://github.com/rofl0r/libssh/blob/master/examples/sample.c
@@ -29,24 +34,31 @@ const unsigned int configSTACK = 51200;
 // max number of concurrent connections
 #define MAX_CONNS 10
 // user name to log in with
-#define REMOTEUSER "username"
+//#define REMOTEUSER "username"
 // server to connect to
-#define REMOTETARGET "servername.example.com"
+//#define REMOTETARGET "192.168.1.1"
 // port to listen to on remote server to tunnel connections back
-#define REMOTEPORT 8888
+//#define REMOTEPORT 8888
 // where to forward remote connections to
-#define LOCALTARGET "127.0.0.1"
-#define LOCALPORT 80
+//#define LOCALTARGET "192.168.1.2"
+//#define LOCALPORT 80
 // set to expected public key to verify server authenticity
 // leave undefined to skip verification
-#define EXPECTEDKEY "xxx"
+//#define EXPECTEDKEY "192.168.1.1 AAAA....=="
 // set to define private key to log in with
 // leave undefined to not use private key authentication
-#define PRIVATEKEY "yyy"
+//#define PRIVATEKEY "yyy"
 // set to define password to log in with
 // leave undefined to not use password authentication
-#define PASSWORD "Password123"
+//#define PASSWORD "password"
+#include <secretstuff.h>
 
+// eventfd configuration - we only need a single eventfd
+static esp_vfs_eventfd_config_t eventfd_config = {
+    max_fds: 1
+};
+static int local_data_ready = -1;
+static QueueHandle_t local_messages;
 
 static void webpage(AsyncWebServerRequest *request) {
     AsyncWebServerResponse *response = nullptr;
@@ -72,48 +84,6 @@ static void tunnel_task (void *)
             delay(1000 * (30 - diff));
         }
     }
-}
-
-void setup() {
-    // Serial port for debugging purposes
-    Serial.begin(115200);
-    WIFI_init("tunneltest",true);
-    WS_init("tunneltest");
-    UD_init(server);
-    server.on("/tunneltest", HTTP_GET, webpage);
-
-    // Initialize the Arduino library.
-    libssh_begin();
-
-#ifdef PRIVATEKEY
-    // key needs to start with 
-    // "-----BEGIN OPENSSH PRIVATE KEY-----"
-    // or
-    // "-----BEGIN RSA PRIVATE KEY-----"
-    // PRIVATEKEY holds key to log in with
-    int rc = ssh_pki_import_privkey_base64(
-        PRIVATEKEY, // base64 encoded private key
-        NULL,       // key passphrase
-        NULL,       // no custom auth function
-        NULL,       // no custom auth data
-        &my_pkey);
-
-    if (rc != SSH_OK || my_pkey == NULL) {
-        Serial.printf("Failed to import public key %d\n",rc);
-        syslogf("Failed to import public key %d",rc);
-    }
-#endif
-
-    // TODO run task
-    // Stack size needs to be larger, so continue in a new task.
-    //xTaskCreatePinnedToCore(tunnel_task, "tunnel", configSTACK, NULL, (tskIDLE_PRIORITY + 3), NULL, portNUM_PROCESSORS - 1);
-    xTaskCreate(tunnel_task, "tunnel", configSTACK, NULL, 1, NULL);
-}
-
-void loop() {
-  // put your main code here, to run repeatedly:
-
-  // TODO if not connect and wifi is connected then reconnect
 }
 
 /////////////////////////////////////////////////////////
@@ -154,6 +124,7 @@ bool verify_knownhost(ssh_session session)
 
     rc = ssh_get_server_publickey(session, &srv_pubkey);
     if (rc < 0) {
+        syslogf("Failed to retrieve server public key");
         return false;
     }
 
@@ -161,6 +132,7 @@ bool verify_knownhost(ssh_session session)
     if (cmp == 0) {
         // hash is correct
         rc = true;
+        syslogf("Host key for server is correct");
     } else {
         syslogf("Host key for server is wrong");
     }
@@ -183,6 +155,7 @@ bool authenticate(ssh_session session)
     rc = ssh_userauth_none(session, NULL);
     if (rc == SSH_AUTH_SUCCESS) {
         // no auth required, we are in
+        syslogf("Authentication succeeded using type none");
         return true;
     }
     if (rc == SSH_AUTH_ERROR) {
@@ -193,12 +166,15 @@ bool authenticate(ssh_session session)
 
     // grab the supported types
     method = ssh_userauth_list(session, NULL);
+    syslogf("Supported auth types %x",method);
 
 #ifdef PRIVATEKEY
     // Try to authenticate with public key first
     if (method & SSH_AUTH_METHOD_PUBLICKEY) {
+        syslogf("Attempting public key authentication");
         rc = ssh_userauth_publickey(session, NULL, my_pkey);
         if (rc == SSH_AUTH_SUCCESS) {
+            syslogf("Authentication succeeded using type publickey");
             return true;
         }
     }
@@ -208,8 +184,10 @@ bool authenticate(ssh_session session)
     const char * password = PASSWORD;
     // Try to authenticate with password
     if (method & SSH_AUTH_METHOD_PASSWORD) {
+        syslogf("Attempting password authentication");
         rc = ssh_userauth_password(session, NULL, password);
         if (rc == SSH_AUTH_SUCCESS) {
+            syslogf("Authentication succeeded using type password");
             return true;
         }
     }
@@ -219,6 +197,8 @@ bool authenticate(ssh_session session)
         syslogf("Error while authenticating : %s",ssh_get_error(session));
     } else if (rc == SSH_AUTH_DENIED) {
         syslogf("Authentication denied");
+    } else {
+        syslogf("Auth error %d",rc);
     }
     return false;
 }
@@ -229,26 +209,34 @@ ssh_session connect_ssh(const char *host, const char *user,int verbosity){
 
     session=ssh_new();
     if (session == NULL) {
+        syslogf("Failed to create new ssh object");
         return NULL;
     }
 
     if (ssh_options_set(session, SSH_OPTIONS_USER, user) < 0) {
         ssh_free(session);
+        syslogf("Failed to set user option on ssh object");
         return NULL;
     }
 
     if (ssh_options_set(session, SSH_OPTIONS_HOST, host) < 0) {
         ssh_free(session);
+        syslogf("Failed to set host option on ssh object");
         return NULL;
     }
 
-    ssh_options_set(session, SSH_OPTIONS_LOG_VERBOSITY, &verbosity);
+    if (ssh_options_set(session, SSH_OPTIONS_LOG_VERBOSITY, &verbosity)) {
+        ssh_free(session);
+        syslogf("Failed to set log option on ssh object");
+        return NULL;
+    }
 
     if(ssh_connect(session) != 0){
         syslogf("Connection failed : %s",ssh_get_error(session));
     } else if(!verify_knownhost(session)){
         // logged elsewhere
     } else if (authenticate(session)){
+        syslogf("SSH connection succeeded");
         return session;
     }
 
@@ -260,6 +248,10 @@ ssh_session connect_ssh(const char *host, const char *user,int verbosity){
 // main entry point for running the tunnel
 void run_tunnel() {
     ssh_session session;
+    if (load_server_pubkey(session) == false) {
+        syslogf("Failed to load server public key");
+    }
+
     // create outbound session
     session = connect_ssh(REMOTETARGET, REMOTEUSER, 0);
     if (session == NULL) {
@@ -273,6 +265,9 @@ void run_tunnel() {
     ssh_free(session);
 }
 
+static void asynctcp_onDisconnect(void* arg, AsyncClient* client);
+static void asynctcp_onConnect(void* arg, AsyncClient* client);
+static void asynctcp_handleData(void* arg, AsyncClient* client, void *data, size_t len);
 
 class myconn {
     private:
@@ -281,69 +276,81 @@ class myconn {
         time_t m_lasttime;
         bool m_remote_connected;
         bool m_local_connected;
+        bool m_shutdown;
+        bool m_close_remote;
     public:
         myconn(ssh_channel ch) {
-            m_local.onData(&myconn::handleData, this);
-            m_local.onConnect(&myconn::onConnect, this);
-            m_local.onDisconnect(&myconn::onDisconnect, this);
-            m_local.connect(LOCALTARGET, LOCALPORT);
+            Serial.printf("myconn %p opening\n", this);
+
+            // set up member variables
             m_remote = ch;
             m_lasttime = 0;
             m_remote_connected = true;
-            Serial.printf("myconn %p opening\n", this);
+            m_local_connected = false;
+            m_close_remote = false;
+            m_shutdown = false;
+
+            // set up the callbacks
+            m_local.onData(&asynctcp_handleData, this);
+            m_local.onConnect(&asynctcp_onConnect, this);
+            m_local.onDisconnect(&asynctcp_onDisconnect, this);
+
+            // start the connection going - must be last thing
+            m_local.connect(LOCALTARGET, LOCALPORT);
         }
         ~myconn() {
+            Serial.printf("myconn %p deleted\n", this);
+        }
+
+        bool isShutdown() { return m_shutdown; }
+        bool isLocalConnected() { return m_local_connected; }
+        bool needCloseRemote() { bool r = m_close_remote; m_close_remote = false; return r; }
+
+        // cleanly tear the connection down
+        void doShutdown() {
             Serial.printf("myconn %p closing\n", this);
+            if (m_remote_connected) {
+                m_remote_connected = false;
+                m_close_remote = true;
+            }
             if (m_local_connected) {
                 m_local_connected = false;
                 m_local.close();
             }
-            if (m_remote_connected) {
-                m_remote_connected = false;
-                // TODO something less brutal than free
-                //ssh_channel_close(m_remote);
-                ssh_channel_free(m_remote);
-            }
-            // TODO do we need to wait for the close to complete?
+            // wait for the close to complete before marking as shut down
         }
 
-        // asynctcp callback with data to tunnel
-        static void handleData(void* arg, AsyncClient* client, void *data, size_t len) {
-            myconn * c = reinterpret_cast<myconn*>(arg);
-            Serial.printf("myconn %p received %d bytes\n", c, len);
+        void handleDataSync(void *data, size_t len) {
+            Serial.printf("myconn %p processing %d bytes\n", this, len);
             //Serial.write((uint8_t*)data, len);
-            if (c->m_remote_connected) {
-                ssh_channel_write(c->m_remote,data,len);
+            if (m_remote_connected) {
+                ssh_channel_write(m_remote,data,len);
             }
-            c->m_lasttime = time(NULL);
+            m_lasttime = time(NULL);
         }
 
-        // asynctcp callback, connection established
-        static void onConnect(void* arg, AsyncClient* client) {
-            myconn * c = reinterpret_cast<myconn*>(arg);
-            Serial.printf("myconn %p connected to %s on port %d \n", c, LOCALTARGET, LOCALPORT);
-            c->m_lasttime = time(NULL);
-            c->m_local_connected = true;
+        void handleConnectSync() {
+            Serial.printf("myconn %p connected to %s on port %d \n", this, LOCALTARGET, LOCALPORT);
+            m_lasttime = time(NULL);
+            m_local_connected = true;
         }
 
-        static void onDisconnect(void* arg, AsyncClient* client) {
-            myconn * c = reinterpret_cast<myconn*>(arg);
-            Serial.printf("myconn %p disconnected\n", c);
-            c->m_local_connected = false;
+        void handleDisconnectSync() {
+            Serial.printf("myconn %p handle disconnect\n", this);
+            m_local_connected = false;
+            m_shutdown = true;
             // forward the disconnect to the ssh side
-            if (c->m_remote_connected) {
-                ssh_channel_send_eof(c->m_remote);
-                // TODO something less brutal than free
-                //ssh_channel_close(c->m_remote);
-                ssh_channel_free(c->m_remote);
+            if (m_remote_connected) {
+                m_close_remote = true;
             }
         }
+
         // ssh has some data to tunnel
         bool write(void * data, size_t len) {
             // TODO check for buffer space
             m_lasttime = time(NULL);
             if (m_local_connected) {
-                Serial.printf("myconn %p sending %d bytes",this,len);
+                Serial.printf("myconn %p sending %d bytes\n",this,len);
                 m_local.add(reinterpret_cast<const char *>(data), len);
                 m_local.send();
                 return true;
@@ -353,13 +360,91 @@ class myconn {
             }
         }
         bool check_timeout() {
-            if ((time(NULL) - m_lasttime) > 60) {
-                Serial.printf("myconn %p timed out",this);
+            // can only time out after connected
+            if ((m_lasttime != 0) && ((time(NULL) - m_lasttime) > 60)) {
+                Serial.printf("myconn %p timed out\n",this);
                 return true;
             }
             return false;
         }
 };
+
+class local_message {
+    public:
+        typedef enum msgtype { e_local_connected, e_local_closed, e_local_rx } ;
+    private:
+        myconn * m_conn;
+        msgtype m_type;
+        void * m_data;
+        size_t m_len;
+    public:
+        local_message(myconn * a_conn, msgtype a_type) :
+            m_conn(a_conn),
+            m_type(a_type),
+            m_data(NULL),
+            m_len(0) {};
+        local_message(myconn * a_conn, void * a_data, size_t a_len) :
+            m_conn(a_conn),
+            m_type(e_local_rx)
+        {
+            // take a copy of the data
+            m_data = malloc(a_len);
+            m_len = a_len;
+            memcpy(m_data, a_data, a_len);
+        };
+        ~local_message() {
+            if (m_data) {
+                delete m_data;
+            }
+        }
+        void dispatch() {
+            // process the message
+            Serial.printf("myconn %p handling message type %d\n",m_conn,m_type);
+            switch (m_type) {
+                case e_local_connected:
+                    m_conn->handleConnectSync();
+                    break;
+                case e_local_closed:
+                    m_conn->handleDisconnectSync();
+                    break;
+                case e_local_rx:
+                    m_conn->handleDataSync(m_data,m_len);
+                    break;
+            }
+        }
+};
+
+// prototype needed to avoid arduino compiler bugs
+static bool send_message(local_message * m);
+static bool send_message(local_message * m) {
+    // enqueue message
+    xQueueSend(local_messages, &m, 100);
+    // signal main thread
+    uint64_t n = 1;
+    size_t x = write(local_data_ready, &n, sizeof(n));
+    Serial.printf("Wrote message %p, %d in queue, eventfd wrote %d\n",m,uxQueueMessagesWaiting(local_messages),x);
+    return (x == sizeof(n));
+}
+
+// asynctcp callback with data to tunnel
+static void asynctcp_handleData(void* arg, AsyncClient* client, void *data, size_t len) {
+    myconn * c = reinterpret_cast<myconn*>(arg);
+    Serial.printf("myconn %p received %d bytes\n", c, len);
+    //Serial.write((uint8_t*)data, len);
+    send_message(new local_message(c, data, len));
+}
+// asynctcp callback, connection established
+static void asynctcp_onConnect(void* arg, AsyncClient* client) {
+    myconn * c = reinterpret_cast<myconn*>(arg);
+    Serial.printf("myconn %p connected\n",c);
+    send_message(new local_message(c, local_message::e_local_connected));
+}
+// asynctcp callback, forwarded connection disconnected from us
+static void asynctcp_onDisconnect(void* arg, AsyncClient* client) {
+    myconn * c = reinterpret_cast<myconn*>(arg);
+    Serial.printf("myconn %p disconnected\n", c);
+    send_message(new local_message(c, local_message::e_local_closed));
+}
 
 // we got an outbound connection with its reverse tunnel
 // wait for tunnelled connections and run them
@@ -381,8 +466,6 @@ void run_tunnel2(ssh_session & session) {
 
     // the set of connections
     std::map<ssh_channel,myconn *> conn_list;
-    // buffer to pass to select
-    ssh_channel channels[MAX_CONNS+1];
 
     while (ssh_is_connected(session)) {
         int timeout = 0;
@@ -395,7 +478,7 @@ void run_tunnel2(ssh_session & session) {
             channel = ssh_channel_accept_forward(session, timeout, NULL);
             if (channel != NULL) {
                 // got incoming connection
-                Serial.printf("Got new connection %p\n",channel);
+                Serial.printf("Got new connection channel %p\n",channel);
                 conn_list[channel] = new myconn(channel);
             } else if (conn_list.empty()) {
                 // no connected channels, go round the loop again
@@ -404,10 +487,7 @@ void run_tunnel2(ssh_session & session) {
         }
      
         // the business end
-
-        // TODO blocking writes
         // TODO errors
-        // TODO races/threading upon deletion
 
         // wait for max 1 sec before checking for timeouts
         tmo.tv_sec = 1; tmo.tv_usec = 0;
@@ -416,74 +496,186 @@ void run_tunnel2(ssh_session & session) {
         // tidy any existing closures
         int i=0;
         std::map<ssh_channel,myconn *>::const_iterator j = conn_list.begin();
+        // buffer to pass to select
+        ssh_channel channels[MAX_CONNS+1];
 
         while ((i < MAX_CONNS) && (j != conn_list.end())) {
             if (!ssh_channel_is_open(j->first)) {
                 // likely local closed on us, async has closed the ssh channel
                 // so we are just tidying up here
                 Serial.printf("Channel %p has closed\n",j->second);
-                delete j->second;
-                conn_list.erase(j++);
+                if (j->second->isShutdown()) {
+                    // forwarding side has also gone
+                    delete j->second;
+                    conn_list.erase(j++);
+                    ssh_channel_free(j->first);
+                    Serial.printf("Connection channel %p is now gone\n",j->first);
+                } else {
+                    Serial.printf("Channel %p closing local\n",j->second);
+                    // must tell the forwarding side to go away
+                    j->second->doShutdown();
+                    // leave the object in place until it has shut down
+                    ++j;
+                }
             } else if (j->second->check_timeout()) {
                 // channel has timed out, close it
                 Serial.printf("Channel %p has timed out\n",j->second);
-
-                // the delete will close both sides
-                delete j->second;
-                conn_list.erase(j++);
+                j->second->doShutdown();
+                ++j;
+            } else if (j->second->needCloseRemote()) {
+                // local has gone away and we must close the remote side
+                Serial.printf("Channel %p closing remote\n",j->second);
+                ssh_channel_send_eof(j->first);
+                ssh_channel_close(j->first);
+                ++j;
+            } else if (!j->second->isLocalConnected()) {
+                // channel is active but local is not yet connected so skip this time around
+                Serial.printf("Channel %p not connected\n",j->second);
+                ++j;
             } else {
+                // channel is still active
                 // wait for some data
                 channels[i++] = j->first;
                 ++j;
             }
         }
 
-        // if there are any active connections to run...
-        if (i > 0) {
-            // find the connections with data
-            channels[i] = NULL;
-            rc = ssh_channel_select(channels,NULL,NULL,&tmo);
-            // check each connection reported by select
-            while (--i >= 0) {
-                if (channels[i] != NULL) {
-                    // run connection until block
-                    while(channels[i] && ssh_channel_is_open(channels[i]) && ssh_channel_poll(channels[i],0)>0){
-                        int len=ssh_channel_read(channels[i],buffer,sizeof(buffer),0);
-                        if(len==-1){
-                            // drop out of the loop when not readable
-                            Serial.printf("Error reading channel %d %p: %s\n", i, conn_list[channels[i]], ssh_get_error(session));
+        // terminate the ssh channel list
+        channels[i] = NULL;
+
+        // wait for something to happen
+        fd_set fds;
+        int maxfd;
+        int k = ssh_get_fd(session);
+        FD_ZERO(&fds);
+        FD_SET(k, &fds);
+        FD_SET(local_data_ready, &fds);
+        maxfd = 1+std::max(k,local_data_ready);
+
+        // find the connections with data
+        // TODO fix: if local never connects we never check the ssh side to see if it closes
+        rc = select(maxfd, &fds, NULL, NULL, &tmo);
+        Serial.printf("1 maxfd %d rc %d sshfd %d ldr %d\n",maxfd,rc,k,local_data_ready);
+
+        // some data has come in from the local side
+        if (FD_ISSET(local_data_ready, &fds)) {
+            // clear the eventfd
+            uint64_t n;
+            read(local_data_ready, &n, sizeof(n));
+            Serial.printf("Processing %d messages\n",uxQueueMessagesWaiting(local_messages));
+
+            // process the local data queue
+            local_message * m;
+            while (xQueueReceive(local_messages, &m, 0) == pdTRUE) {
+                Serial.printf("Processing message %p\n",m);
+                m->dispatch();
+                delete(m);
+            }
+        }
+
+        if (!FD_ISSET(ssh_get_fd(session),&fds)) {
+            // TODO see if ssh fd ever fires
+            // nothing waiting for the ssh side so continue round the loop
+            Serial.printf("ssh not ready\n");
+            //continue;
+        }
+
+        tmo.tv_sec = 0; tmo.tv_usec = 0;
+        rc = ssh_channel_select(channels,NULL,NULL,&tmo);
+        Serial.printf("2 rc %d\n",rc);
+
+        // check each connection reported by select
+        while (--i >= 0) {
+            if (channels[i] != NULL) {
+                // run connection until block
+                while(channels[i] && ssh_channel_is_open(channels[i]) && ssh_channel_poll(channels[i],0)>0){
+                    int len=ssh_channel_read(channels[i],buffer,sizeof(buffer),0);
+                    if(len==-1){
+                        // drop out of the loop when not readable
+                        Serial.printf("Error reading channel %d %p: %s\n", i, conn_list[channels[i]], ssh_get_error(session));
+                        break;
+                    } else if(len==0){
+                        Serial.printf("EOF on channel %d %p %d\n", i, conn_list[channels[i]],ssh_channel_get_exit_status(channels[i]));
+                        conn_list[channels[i]]->doShutdown();
+                        break;
+                    } else {
+                        // have some data, send to local
+                        if (!conn_list[channels[i]]->write(buffer,len)) {
+                            Serial.printf("Write failure on channel %d %p\n", i, conn_list[channels[i]]);
+                            // error occurred, close the connection
+                            conn_list[channels[i]]->doShutdown();
                             break;
-                        } else if(len==0){
-                            Serial.printf("EOF on channel %d %p %d\n", i, conn_list[channels[i]],ssh_channel_get_exit_status(channel));
-                            delete conn_list[channels[i]];
-                            conn_list.erase(channels[i]);
-                            // the delete will free the channel
-                            // TODO synchronise the channel free
-                            //ssh_channel_free(channels[i]);
-                            break;
-                        } else {
-                            // have some data, send to local
-                            if (!conn_list[channels[i]]->write(buffer,len)) {
-                                Serial.printf("Write failure on channel %d %p\n", i, conn_list[channels[i]]);
-                                // error occurred, close the connection
-                                delete conn_list[channels[i]];
-                                conn_list.erase(channels[i]);
-                                break;
-                            }
                         }
                     }
                 }
-            } // end of running a connection
-
-        } // end of >0 connections active
+            }
+        } // end of running a connection
 
     } // end of session still active
 
-    // TODO close local connections
-    Serial.printf("Session closed, closing connections\n");
+    // close local connections
+    Serial.printf("Session closed, closing %d connections\n",conn_list.size());
+    std::map<ssh_channel,myconn *>::const_iterator j = conn_list.begin();
+    while (j != conn_list.end()) {
+        // close everything as required
+        j->second->doShutdown();
+        ++j;
+    }
+    delay(1000);
     while (conn_list.begin() != conn_list.end()) {
         // deleting the connection will close the ssh channel
         delete conn_list.begin()->second;
+        ssh_channel_free(conn_list.begin()->first);
         conn_list.erase(conn_list.begin());
     }
 }
+
+void setup() {
+    // Serial port for debugging purposes
+    Serial.begin(115200);
+    WIFI_init("tunneltest",true);
+    SyslogInit("tunneltest");
+    WS_init("tunneltest");
+    UD_init(server);
+    server.on("/tunneltest", HTTP_GET, webpage);
+
+    // set up eventfd for waking the foreground task to deal with
+    // data received on the async tcp side
+    esp_vfs_eventfd_register(&eventfd_config);
+    local_data_ready = eventfd(0,0 /*EFD_SUPPORT_ISR*/);
+    local_messages = xQueueCreate(20,sizeof(local_message*));
+
+    // Initialize the Arduino library.
+    libssh_begin();
+
+#ifdef PRIVATEKEY
+    // key needs to start with 
+    // "-----BEGIN OPENSSH PRIVATE KEY-----"
+    // or
+    // "-----BEGIN RSA PRIVATE KEY-----"
+    // PRIVATEKEY holds key to log in with
+    int rc = ssh_pki_import_privkey_base64(
+        PRIVATEKEY, // base64 encoded private key
+        NULL,       // key passphrase
+        NULL,       // no custom auth function
+        NULL,       // no custom auth data
+        &my_pkey);
+
+    if (rc != SSH_OK || my_pkey == NULL) {
+        Serial.printf("Failed to import public key %d\n",rc);
+        syslogf("Failed to import public key %d",rc);
+    }
+#endif
+
+    // TODO run task
+    // Stack size needs to be larger, so continue in a new task.
+    //xTaskCreatePinnedToCore(tunnel_task, "tunnel", configSTACK, NULL, (tskIDLE_PRIORITY + 3), NULL, portNUM_PROCESSORS - 1);
+    xTaskCreate(tunnel_task, "tunnel", configSTACK, NULL, 1, NULL);
+}
+
+void loop() {
+  // put your main code here, to run repeatedly:
+
+  // TODO if not connect and wifi is connected then reconnect
+}
+
