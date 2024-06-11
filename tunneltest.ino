@@ -51,7 +51,7 @@ const unsigned int configSTACK = 51200;
 // set to define password to log in with
 // leave undefined to not use password authentication
 //#define PASSWORD "password"
-#include <secretstuff.h>
+#include "secretstuff.h"
 
 // eventfd configuration - we only need a single eventfd
 static esp_vfs_eventfd_config_t eventfd_config = {
@@ -146,6 +146,7 @@ bool verify_knownhost(ssh_session session)
 }
 
 bool authenticate(ssh_session session)
+
 {
     int method;
     char *banner;
@@ -475,6 +476,7 @@ void run_tunnel2(ssh_session & session) {
 
         // do not permit more than max connections
         if (conn_list.size() < MAX_CONNS) {
+            Serial.printf("Checking for new connections for %d\n",timeout);
             channel = ssh_channel_accept_forward(session, timeout, NULL);
             if (channel != NULL) {
                 // got incoming connection
@@ -486,20 +488,57 @@ void run_tunnel2(ssh_session & session) {
             }
         }
      
-        // the business end
-        // TODO errors
+        // wait for something to happen
+        fd_set fds;
+        int maxfd;
+        int k = ssh_get_fd(session);
+        FD_ZERO(&fds);
+        FD_SET(k, &fds);
+        FD_SET(local_data_ready, &fds);
+        maxfd = 1+std::max(k,local_data_ready);
 
         // wait for max 1 sec before checking for timeouts
         tmo.tv_sec = 1; tmo.tv_usec = 0;
 
+        // find the connections with data
+        // TODO fix: if local never connects we never check the ssh side to see if it closes
+        Serial.printf("0 maxfd %d sshfd %d ldr %d\n",maxfd,k,local_data_ready);
+        rc = select(maxfd, &fds, NULL, NULL, &tmo);
+        Serial.printf("1 rc %d\n",rc);
+
+        // some data has come in from the local side
+        if (FD_ISSET(local_data_ready, &fds)) {
+            // clear the eventfd
+            uint64_t n;
+            read(local_data_ready, &n, sizeof(n));
+            Serial.printf("Processing %d messages\n",uxQueueMessagesWaiting(local_messages));
+
+            // process the local data queue
+            local_message * m;
+            while (xQueueReceive(local_messages, &m, 0) == pdTRUE) {
+                Serial.printf("Processing message %p\n",m);
+                m->dispatch();
+                delete(m);
+            }
+        }
+
+        if (!FD_ISSET(ssh_get_fd(session),&fds)) {
+            // TODO see if ssh fd ever fires
+            // nothing waiting for the ssh side so continue round the loop
+            Serial.printf("ssh not ready\n");
+            //continue;
+        } else {
+            Serial.printf("kick ssh\n");
+            ssh_set_fd_toread(session);
+        }
+
+        // TODO handle errors
+
         // build list of connections to watch
         // tidy any existing closures
-        int i=0;
         std::map<ssh_channel,myconn *>::const_iterator j = conn_list.begin();
-        // buffer to pass to select
-        ssh_channel channels[MAX_CONNS+1];
 
-        while ((i < MAX_CONNS) && (j != conn_list.end())) {
+        while (j != conn_list.end()) {
             if (!ssh_channel_is_open(j->first)) {
                 // likely local closed on us, async has closed the ssh channel
                 // so we are just tidying up here
@@ -507,8 +546,8 @@ void run_tunnel2(ssh_session & session) {
                 if (j->second->isShutdown()) {
                     // forwarding side has also gone
                     delete j->second;
-                    conn_list.erase(j++);
                     ssh_channel_free(j->first);
+                    conn_list.erase(j++);
                     Serial.printf("Connection channel %p is now gone\n",j->first);
                 } else {
                     Serial.printf("Channel %p closing local\n",j->second);
@@ -534,80 +573,33 @@ void run_tunnel2(ssh_session & session) {
                 ++j;
             } else {
                 // channel is still active
-                // wait for some data
-                channels[i++] = j->first;
-                ++j;
-            }
-        }
-
-        // terminate the ssh channel list
-        channels[i] = NULL;
-
-        // wait for something to happen
-        fd_set fds;
-        int maxfd;
-        int k = ssh_get_fd(session);
-        FD_ZERO(&fds);
-        FD_SET(k, &fds);
-        FD_SET(local_data_ready, &fds);
-        maxfd = 1+std::max(k,local_data_ready);
-
-        // find the connections with data
-        // TODO fix: if local never connects we never check the ssh side to see if it closes
-        rc = select(maxfd, &fds, NULL, NULL, &tmo);
-        Serial.printf("1 maxfd %d rc %d sshfd %d ldr %d\n",maxfd,rc,k,local_data_ready);
-
-        // some data has come in from the local side
-        if (FD_ISSET(local_data_ready, &fds)) {
-            // clear the eventfd
-            uint64_t n;
-            read(local_data_ready, &n, sizeof(n));
-            Serial.printf("Processing %d messages\n",uxQueueMessagesWaiting(local_messages));
-
-            // process the local data queue
-            local_message * m;
-            while (xQueueReceive(local_messages, &m, 0) == pdTRUE) {
-                Serial.printf("Processing message %p\n",m);
-                m->dispatch();
-                delete(m);
-            }
-        }
-
-        if (!FD_ISSET(ssh_get_fd(session),&fds)) {
-            // TODO see if ssh fd ever fires
-            // nothing waiting for the ssh side so continue round the loop
-            Serial.printf("ssh not ready\n");
-            //continue;
-        }
-
-        tmo.tv_sec = 0; tmo.tv_usec = 0;
-        rc = ssh_channel_select(channels,NULL,NULL,&tmo);
-        Serial.printf("2 rc %d\n",rc);
-
-        // check each connection reported by select
-        while (--i >= 0) {
-            if (channels[i] != NULL) {
-                // run connection until block
-                while(channels[i] && ssh_channel_is_open(channels[i]) && ssh_channel_poll(channels[i],0)>0){
-                    int len=ssh_channel_read(channels[i],buffer,sizeof(buffer),0);
+                // run connection until no more data
+                int len;
+                while (1) {
+                    len=ssh_channel_read_timeout(j->first,buffer,sizeof(buffer),0,0);
+                    Serial.printf("Channel %p read %d\n",j->first,len);
                     if(len==-1){
                         // drop out of the loop when not readable
-                        Serial.printf("Error reading channel %d %p: %s\n", i, conn_list[channels[i]], ssh_get_error(session));
+                        Serial.printf("Error reading channel %p: %s\n", j->second, ssh_get_error(session));
                         break;
-                    } else if(len==0){
-                        Serial.printf("EOF on channel %d %p %d\n", i, conn_list[channels[i]],ssh_channel_get_exit_status(channels[i]));
-                        conn_list[channels[i]]->doShutdown();
-                        break;
-                    } else {
+                    } else if (len > 0) {
                         // have some data, send to local
-                        if (!conn_list[channels[i]]->write(buffer,len)) {
-                            Serial.printf("Write failure on channel %d %p\n", i, conn_list[channels[i]]);
+                        if (!j->second->write(buffer,len)) {
+                            Serial.printf("Write failure on channel %p\n", j->second);
                             // error occurred, close the connection
-                            conn_list[channels[i]]->doShutdown();
+                            j->second->doShutdown();
                             break;
                         }
+                    } else if (ssh_channel_is_eof(j->first)) {
+                        Serial.printf("EOF on channel %p\n", j->second);
+                        j->second->doShutdown();
+                        break;
+                    } else {
+                        // no data received
+                        break;
                     }
                 }
+                ++j;
             }
         } // end of running a connection
 
